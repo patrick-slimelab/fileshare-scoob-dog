@@ -4,7 +4,8 @@ import { createRoot } from "https://esm.sh/react-dom@18/client";
 const LIST_ENDPOINT = "/api/files";
 const CHUNK_UPLOAD_ENDPOINT = "/api/files/upload/chunk";
 const COMPLETE_UPLOAD_ENDPOINT = "/api/files/upload/complete";
-const CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+const CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
+const CHUNK_UPLOAD_RETRIES = 3;
 const h = React.createElement;
 
 function formatBytes(bytes) {
@@ -164,13 +165,34 @@ function App() {
           formData.append("path", trimmedPath);
         }
 
-        const chunkResponse = await fetch(CHUNK_UPLOAD_ENDPOINT, {
-          method: "POST",
-          body: formData
-        });
+        let chunkUploaded = false;
+        let lastChunkError = null;
 
-        if (!chunkResponse.ok) {
-          throw new Error(await extractUploadErrorMessage(chunkResponse));
+        for (let attempt = 1; attempt <= CHUNK_UPLOAD_RETRIES; attempt += 1) {
+          try {
+            const chunkResponse = await fetch(CHUNK_UPLOAD_ENDPOINT, {
+              method: "POST",
+              body: formData
+            });
+
+            if (!chunkResponse.ok) {
+              throw new Error(await extractUploadErrorMessage(chunkResponse));
+            }
+
+            chunkUploaded = true;
+            break;
+          } catch (error) {
+            lastChunkError = error;
+            if (attempt < CHUNK_UPLOAD_RETRIES) {
+              await new Promise((resolve) => setTimeout(resolve, attempt * 600));
+            }
+          }
+        }
+
+        if (!chunkUploaded) {
+          throw (lastChunkError instanceof Error
+            ? lastChunkError
+            : new Error("Upload failed due to a network error."));
         }
 
         const bytesUploaded = chunkEnd;

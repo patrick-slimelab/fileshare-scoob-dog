@@ -37,7 +37,7 @@ Service:
 Web UI:
 - Use the upload form on the main page to choose a file.
 - Optional subfolder path (for example `reports/2026`) uploads into that directory under `FILESHARE_ROOT`.
-- Uploads are sent in 8 MB chunks to stay under reverse-proxy request-size limits (for example Cloudflare).
+- Uploads are sent in 4 MB chunks to stay under reverse-proxy request-size limits (for example Cloudflare).
 - The UI shows upload state/progress and refreshes the file list after success.
 
 API:

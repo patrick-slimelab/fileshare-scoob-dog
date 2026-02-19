@@ -178,6 +178,10 @@ app.MapPost("/api/files/upload/chunk", async (HttpRequest request) =>
     {
         return Results.BadRequest("Invalid form payload.");
     }
+    catch (BadHttpRequestException)
+    {
+        return Results.BadRequest("Upload request was interrupted. Please retry.");
+    }
 
     var chunkFile = form.Files.GetFile("chunk");
     if (chunkFile is null)
