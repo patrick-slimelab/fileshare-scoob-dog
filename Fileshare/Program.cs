@@ -79,6 +79,85 @@ app.MapGet("/api/files/download/{**path}", (string path) =>
     return Results.File(fileInfo.FullName, "application/octet-stream", fileInfo.Name, enableRangeProcessing: true);
 });
 
+app.MapPost("/api/files/upload", async (HttpRequest request) =>
+{
+    var contentType = request.ContentType ?? string.Empty;
+    if (!request.HasFormContentType ||
+        !contentType.StartsWith("multipart/form-data", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest("Content type must be multipart/form-data.");
+    }
+
+    IFormCollection form;
+    try
+    {
+        form = await request.ReadFormAsync(request.HttpContext.RequestAborted);
+    }
+    catch (InvalidDataException)
+    {
+        return Results.BadRequest("Invalid form payload.");
+    }
+
+    var uploadedFile = form.Files.GetFile("file");
+    if (uploadedFile is null)
+    {
+        return Results.BadRequest("Field 'file' is required.");
+    }
+
+    if (!TryNormalizeUploadFileName(uploadedFile.FileName, out var fileName, out var fileNameError))
+    {
+        return Results.BadRequest(fileNameError);
+    }
+
+    var requestedPath = form["path"].ToString();
+    if (!TryNormalizeRelativePath(requestedPath, out var pathSegments, out var pathError))
+    {
+        return Results.BadRequest(pathError);
+    }
+
+    var relativeSegments = pathSegments.Append(fileName).ToArray();
+    var destinationPath = Path.GetFullPath(Path.Combine(fileRootFullPath, Path.Combine(relativeSegments)));
+    if (!IsSubPathOf(fileRootFullPath, destinationPath))
+    {
+        return Results.BadRequest("Invalid path.");
+    }
+
+    if (File.Exists(destinationPath))
+    {
+        return Results.Conflict("File already exists.");
+    }
+
+    var destinationDirectory = Path.GetDirectoryName(destinationPath) ?? fileRootFullPath;
+    if (!IsSubPathOf(fileRootFullPath, destinationDirectory))
+    {
+        return Results.BadRequest("Invalid path.");
+    }
+
+    Directory.CreateDirectory(destinationDirectory);
+
+    try
+    {
+        await using var outputStream = new FileStream(
+            destinationPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 81920,
+            useAsync: true);
+        await using var inputStream = uploadedFile.OpenReadStream();
+        await inputStream.CopyToAsync(outputStream, request.HttpContext.RequestAborted);
+    }
+    catch (IOException) when (File.Exists(destinationPath))
+    {
+        return Results.Conflict("File already exists.");
+    }
+
+    var fileInfo = new FileInfo(destinationPath);
+    var relativePath = Path.GetRelativePath(fileRootFullPath, fileInfo.FullName).Replace('\\', '/');
+
+    return Results.Ok(new FileEntry(fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, relativePath));
+});
+
 app.MapFallbackToFile("index.html");
 
 app.Run();
@@ -225,6 +304,75 @@ static bool IsSubPathOf(string rootPath, string candidatePath)
     }
 
     return normalizedCandidate.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, comparison);
+}
+
+static bool TryNormalizeRelativePath(string? rawPath, out string[] segments, out string error)
+{
+    error = string.Empty;
+    if (string.IsNullOrWhiteSpace(rawPath))
+    {
+        segments = Array.Empty<string>();
+        return true;
+    }
+
+    var normalizedPath = rawPath.Replace('\\', '/').Trim('/');
+    if (string.IsNullOrWhiteSpace(normalizedPath))
+    {
+        segments = Array.Empty<string>();
+        return true;
+    }
+
+    segments = normalizedPath
+        .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
+    {
+        error = "Invalid path.";
+        return false;
+    }
+
+    if (segments.Any(segment => segment.StartsWith(".", StringComparison.Ordinal)))
+    {
+        error = "Hidden paths are not allowed.";
+        return false;
+    }
+
+    return true;
+}
+
+static bool TryNormalizeUploadFileName(string? rawFileName, out string fileName, out string error)
+{
+    error = string.Empty;
+    fileName = string.Empty;
+
+    if (string.IsNullOrWhiteSpace(rawFileName))
+    {
+        error = "Field 'file' is required.";
+        return false;
+    }
+
+    var normalized = rawFileName.Replace('\\', '/').Trim('/');
+    var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
+    {
+        error = "Invalid file name.";
+        return false;
+    }
+
+    if (segments.Any(segment => segment.StartsWith(".", StringComparison.Ordinal)))
+    {
+        error = "Hidden files are not allowed.";
+        return false;
+    }
+
+    fileName = segments[^1];
+    if (string.IsNullOrWhiteSpace(fileName))
+    {
+        error = "Invalid file name.";
+        return false;
+    }
+
+    return true;
 }
 
 static bool PathsEqual(string left, string right)

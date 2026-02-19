@@ -30,8 +30,88 @@ h1 {
   color: #4a5668;
 }
 
+h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
 .error {
   margin: 0.75rem 0;
+  color: #a1172f;
+}
+
+.upload-card {
+  margin: 0 0 1rem;
+  padding: 1rem;
+  border: 1px solid #d7deea;
+  border-radius: 0.75rem;
+  background: #fff;
+}
+
+.upload-controls {
+  margin-top: 0.75rem;
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  color: #4a5668;
+}
+
+.field input {
+  width: 100%;
+  border: 1px solid #c9d4e5;
+  border-radius: 0.5rem;
+  padding: 0.55rem 0.65rem;
+  font: inherit;
+  color: inherit;
+  background: #fff;
+}
+
+.field input:focus {
+  outline: 2px solid #bdd3f4;
+  outline-offset: 1px;
+}
+
+button {
+  border: 1px solid #1e5eb8;
+  border-radius: 0.5rem;
+  background: #1f63c4;
+  color: #fff;
+  padding: 0.6rem 1rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:enabled {
+  background: #1b58ae;
+}
+
+button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.upload-status {
+  margin: 0.7rem 0 0;
+  font-size: 0.92rem;
+}
+
+.upload-status.uploading {
+  color: #244a81;
+}
+
+.upload-status.success {
+  color: #1a6d3f;
+}
+
+.upload-status.error {
   color: #a1172f;
 }
 
@@ -79,4 +159,14 @@ a {
 
 a:hover {
   text-decoration: underline;
+}
+
+@media (max-width: 800px) {
+  .upload-controls {
+    grid-template-columns: 1fr;
+  }
+
+  button {
+    width: fit-content;
+  }
 }

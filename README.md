@@ -5,6 +5,7 @@ Simple authenticated file browser/download service:
 - Static React frontend served from `wwwroot`
 - HTTP Basic Auth on all routes
 - Recursive file listing API + secure download API
+- Authenticated multipart upload API + frontend upload widget
 
 ## Configuration
 
@@ -30,6 +31,35 @@ docker compose up --build
 Service:
 - URL: `http://localhost:8080`
 - Mounted files: `./shared-files` -> `/data/files` (read-only)
+
+## Uploads
+
+Web UI:
+- Use the upload form on the main page to choose a file.
+- Optional subfolder path (for example `reports/2026`) uploads into that directory under `FILESHARE_ROOT`.
+- The UI shows upload state and refreshes the file list after success.
+
+API:
+- Endpoint: `POST /api/files/upload`
+- Content-Type: `multipart/form-data`
+- Required form field: `file`
+- Optional form field: `path` (relative subdirectory under `FILESHARE_ROOT`)
+- Overwrite behavior: existing destination files return `409 Conflict`
+- Response JSON: `{name,size,lastModifiedUtc,relativePath}`
+
+Security behavior:
+- Rejects path traversal (`.` / `..`) and hidden path segments (segments starting with `.`)
+- Rejects hidden upload names (file names starting with `.`)
+- Normalizes path separators and ensures destination remains inside `FILESHARE_ROOT`
+
+Example:
+
+```bash
+curl -u scoob:choom \
+  -F "file=@./example.txt" \
+  -F "path=docs/notes" \
+  http://localhost:8080/api/files/upload
+```
 
 ## Reverse proxy note (`fileshare.scoob.dog`)
 
