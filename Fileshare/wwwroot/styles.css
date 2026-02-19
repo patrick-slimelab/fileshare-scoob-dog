@@ -115,6 +115,19 @@ button:disabled {
   color: #a1172f;
 }
 
+.visibility-status {
+  margin: 0.75rem 0;
+  font-size: 0.92rem;
+}
+
+.visibility-status.success {
+  color: #1a6d3f;
+}
+
+.visibility-status.error {
+  color: #a1172f;
+}
+
 .table-wrap {
   overflow-x: auto;
   border: 1px solid #d7deea;
@@ -170,6 +183,24 @@ a:hover {
 .actions-cell button {
   padding: 0.35rem 0.7rem;
   font-size: 0.85rem;
+}
+
+.actions-cell .visibility-button.public {
+  border-color: #a1172f;
+  background: #c1273c;
+}
+
+.actions-cell .visibility-button.public:hover:enabled {
+  background: #a81f33;
+}
+
+.actions-cell .visibility-button.private {
+  border-color: #1a6d3f;
+  background: #22834c;
+}
+
+.actions-cell .visibility-button.private:hover:enabled {
+  background: #1c6f40;
 }
 
 @media (max-width: 800px) {

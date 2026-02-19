@@ -3,7 +3,7 @@
 Simple authenticated file browser/download service:
 - ASP.NET Core (`net8.0`) backend
 - Static React frontend served from `wwwroot`
-- HTTP Basic Auth on all routes
+- HTTP Basic Auth on API/UI routes (public file downloads can be enabled per file)
 - Recursive file listing API + secure download API
 - Authenticated upload APIs + frontend upload widget
 
@@ -13,6 +13,10 @@ Environment variables:
 - `FILESHARE_USERNAME` (default: `scoob`)
 - `FILESHARE_PASSWORD` (default: `choom`)
 - `FILESHARE_ROOT` (default: `/data/files`)
+
+Visibility metadata:
+- Per-file visibility is persisted at `FILESHARE_ROOT/.fileshare-visibility.json`
+- Format: `{"publicFiles":["path/a.txt","path/b.txt"]}`
 
 ## Local run
 
@@ -58,6 +62,17 @@ Security behavior:
 - Rejects path traversal (`.` / `..`) and hidden path segments (segments starting with `.`)
 - Rejects hidden upload names (file names starting with `.`)
 - Normalizes path separators and ensures destination remains inside `FILESHARE_ROOT`
+
+## File visibility
+
+- Files are private by default.
+- `GET /api/files` now includes `isPublic` for each file entry.
+- `POST /api/files/visibility` (Basic Auth required) updates file visibility.
+  - Request JSON: `{relativePath,isPublic}`
+  - Response JSON: `{relativePath,isPublic}`
+  - Validation rejects traversal and hidden path segments; only existing visible files are allowed.
+- Unauthenticated access is only allowed for `GET /api/files/download/{**path}` when the target file is marked public.
+- Directory-level visibility is not supported; visibility is file-by-file only.
 
 Example:
 

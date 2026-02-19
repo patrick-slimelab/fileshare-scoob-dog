@@ -4,6 +4,7 @@ import { createRoot } from "https://esm.sh/react-dom@18/client";
 const LIST_ENDPOINT = "/api/files";
 const CHUNK_UPLOAD_ENDPOINT = "/api/files/upload/chunk";
 const COMPLETE_UPLOAD_ENDPOINT = "/api/files/upload/complete";
+const VISIBILITY_ENDPOINT = "/api/files/visibility";
 const CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
 const CHUNK_UPLOAD_RETRIES = 3;
 const h = React.createElement;
@@ -75,6 +76,11 @@ function App() {
     progress: 0
   });
   const [copiedLink, setCopiedLink] = useState("");
+  const [visibilityState, setVisibilityState] = useState({
+    status: "idle",
+    message: ""
+  });
+  const [visibilityUpdatingPath, setVisibilityUpdatingPath] = useState("");
   const fileInputRef = useRef(null);
 
   const loadFiles = useCallback(async () => {
@@ -105,7 +111,7 @@ function App() {
     setSelectedFile(file);
   }
 
-  async function extractUploadErrorMessage(response) {
+  async function extractApiErrorMessage(response, fallbackPrefix) {
     let responseText = "";
     try {
       responseText = (await response.text()).trim();
@@ -114,27 +120,31 @@ function App() {
     }
 
     if (!responseText) {
-      return `Upload failed with HTTP ${response.status}.`;
+      return `${fallbackPrefix} with HTTP ${response.status}.`;
     }
 
     try {
       const parsed = JSON.parse(responseText);
       if (typeof parsed === "string") {
-        return `Upload failed: ${parsed}`;
+        return `${fallbackPrefix}: ${parsed}`;
       }
 
       if (parsed && typeof parsed.detail === "string" && parsed.detail) {
-        return `Upload failed: ${parsed.detail}`;
+        return `${fallbackPrefix}: ${parsed.detail}`;
       }
 
       if (parsed && typeof parsed.title === "string") {
-        return `Upload failed: ${parsed.title}`;
+        return `${fallbackPrefix}: ${parsed.title}`;
       }
     } catch {
       // Keep plain-text response as-is.
     }
 
-    return `Upload failed: ${responseText}`;
+    return `${fallbackPrefix}: ${responseText}`;
+  }
+
+  async function extractUploadErrorMessage(response) {
+    return extractApiErrorMessage(response, "Upload failed");
   }
 
   async function handleUpload(event) {
@@ -279,6 +289,47 @@ function App() {
     }
   }
 
+  async function handleToggleVisibility(file) {
+    const relativePath = file.relativePath;
+    const isPublic = file.isPublic === true;
+
+    setVisibilityUpdatingPath(relativePath);
+    setVisibilityState({
+      status: "idle",
+      message: ""
+    });
+
+    try {
+      const response = await fetch(VISIBILITY_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          relativePath,
+          isPublic: !isPublic
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(await extractApiErrorMessage(response, "Visibility update failed"));
+      }
+
+      setVisibilityState({
+        status: "success",
+        message: `${relativePath} is now ${!isPublic ? "public" : "private"}.`
+      });
+      await loadFiles();
+    } catch (err) {
+      setVisibilityState({
+        status: "error",
+        message: err instanceof Error ? err.message : "Visibility update failed due to a network error."
+      });
+    } finally {
+      setVisibilityUpdatingPath("");
+    }
+  }
+
   const totalSize = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
   const isUploading = uploadState.status === "uploading";
 
@@ -338,6 +389,13 @@ function App() {
           )
     ),
     error ? h("p", { className: "error" }, error) : null,
+    visibilityState.status === "idle"
+      ? null
+      : h(
+          "p",
+          { className: `visibility-status ${visibilityState.status}` },
+          visibilityState.message
+        ),
     h(
       "div",
       { className: "table-wrap" },
@@ -359,8 +417,11 @@ function App() {
         h(
           "tbody",
           null,
-          files.map((file) =>
-            h(
+          files.map((file) => {
+            const isPublic = file.isPublic === true;
+            const isUpdatingVisibility = visibilityUpdatingPath === file.relativePath;
+
+            return h(
               "tr",
               { key: file.relativePath },
               h("td", { className: "name-cell", title: file.relativePath }, file.relativePath),
@@ -381,10 +442,24 @@ function App() {
                     onClick: () => handleCopyPermalink(file.relativePath)
                   },
                   copiedLink === file.relativePath ? "Copied!" : "Permalink"
+                ),
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    className: isPublic ? "visibility-button public" : "visibility-button private",
+                    onClick: () => handleToggleVisibility(file),
+                    disabled: isUpdatingVisibility
+                  },
+                  isUpdatingVisibility
+                    ? "Updating..."
+                    : isPublic
+                      ? "Make Private"
+                      : "Make Public"
                 )
               )
-            )
-          )
+            );
+          })
         )
       )
     )

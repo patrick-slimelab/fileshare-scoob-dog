@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
@@ -10,9 +11,17 @@ var basicAuthPassword = Environment.GetEnvironmentVariable("FILESHARE_PASSWORD")
 var fileRoot = Environment.GetEnvironmentVariable("FILESHARE_ROOT") ?? "/data/files";
 var fileRootFullPath = Path.GetFullPath(fileRoot);
 var uploadTempRoot = Path.GetFullPath(Path.Combine(fileRootFullPath, ".uploads"));
+var visibilityMetadataPath = Path.GetFullPath(Path.Combine(fileRootFullPath, ".fileshare-visibility.json"));
+var visibilityStore = new FileVisibilityStore(fileRootFullPath, visibilityMetadataPath);
 
 app.Use(async (context, next) =>
 {
+    if (CanBypassAuthForPublicDownload(context.Request, fileRootFullPath, visibilityStore))
+    {
+        await next();
+        return;
+    }
+
     if (!TryValidateBasicAuth(context.Request.Headers.Authorization, basicAuthUsername, basicAuthPassword))
     {
         context.Response.Headers.WWWAuthenticate = "Basic realm=\"fileshare\"";
@@ -36,11 +45,16 @@ app.MapGet("/api/files", () =>
 
     var rootDirectory = new DirectoryInfo(fileRootFullPath);
     var files = EnumerateVisibleFiles(rootDirectory)
-        .Select(file => new FileEntry(
-            file.Name,
-            file.Length,
-            file.LastWriteTimeUtc,
-            Path.GetRelativePath(fileRootFullPath, file.FullName).Replace('\\', '/')))
+        .Select(file =>
+        {
+            var relativePath = Path.GetRelativePath(fileRootFullPath, file.FullName).Replace('\\', '/');
+            return new FileEntry(
+                file.Name,
+                file.Length,
+                file.LastWriteTimeUtc,
+                relativePath,
+                visibilityStore.IsPublic(relativePath));
+        })
         .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
         .ToArray();
 
@@ -49,36 +63,50 @@ app.MapGet("/api/files", () =>
 
 app.MapGet("/api/files/download/{**path}", (string path) =>
 {
-    if (string.IsNullOrWhiteSpace(path))
+    if (!TryNormalizeFileRelativePath(path, out _, out var segments, out var pathError))
     {
-        return Results.BadRequest("Path is required.");
+        return Results.BadRequest(pathError);
     }
 
-    var normalizedRelativePath = path.Replace('\\', '/');
-    var segments = normalizedRelativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-    if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
-    {
-        return Results.BadRequest("Invalid path.");
-    }
-
-    var filePath = Path.GetFullPath(Path.Combine(fileRootFullPath, Path.Combine(segments)));
-    if (!IsSubPathOf(fileRootFullPath, filePath))
-    {
-        return Results.BadRequest("Invalid path.");
-    }
-
-    var fileInfo = new FileInfo(filePath);
-    if (!fileInfo.Exists || IsHidden(fileInfo))
-    {
-        return Results.NotFound();
-    }
-
-    if (HasHiddenDirectorySegment(fileInfo.Directory, fileRootFullPath))
+    if (!TryResolveVisibleFile(fileRootFullPath, segments, out var fileInfo))
     {
         return Results.NotFound();
     }
 
     return Results.File(fileInfo.FullName, "application/octet-stream", fileInfo.Name, enableRangeProcessing: true);
+});
+
+app.MapPost("/api/files/visibility", async (HttpRequest request) =>
+{
+    VisibilityRequest? payload;
+    try
+    {
+        payload = await request.ReadFromJsonAsync<VisibilityRequest>(request.HttpContext.RequestAborted);
+    }
+    catch (JsonException)
+    {
+        return Results.BadRequest("Invalid JSON payload.");
+    }
+
+    if (payload is null)
+    {
+        return Results.BadRequest("Body is required.");
+    }
+
+    if (!TryNormalizeFileRelativePath(payload.RelativePath, out _, out var segments, out var pathError))
+    {
+        return Results.BadRequest(pathError);
+    }
+
+    if (!TryResolveVisibleFile(fileRootFullPath, segments, out var fileInfo))
+    {
+        return Results.NotFound();
+    }
+
+    var relativePath = Path.GetRelativePath(fileRootFullPath, fileInfo.FullName).Replace('\\', '/');
+    visibilityStore.SetVisibility(relativePath, payload.IsPublic);
+
+    return Results.Ok(new VisibilityResponse(relativePath, payload.IsPublic));
 });
 
 app.MapPost("/api/files/upload", async (HttpRequest request) =>
@@ -156,8 +184,9 @@ app.MapPost("/api/files/upload", async (HttpRequest request) =>
 
     var fileInfo = new FileInfo(destinationPath);
     var relativePath = Path.GetRelativePath(fileRootFullPath, fileInfo.FullName).Replace('\\', '/');
+    visibilityStore.SetVisibility(relativePath, isPublic: false);
 
-    return Results.Ok(new FileEntry(fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, relativePath));
+    return Results.Ok(new FileEntry(fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, relativePath, false));
 });
 
 app.MapPost("/api/files/upload/chunk", async (HttpRequest request) =>
@@ -395,8 +424,9 @@ app.MapPost("/api/files/upload/complete", async (HttpRequest request) =>
 
     var fileInfo = new FileInfo(destinationPath);
     var relativePath = Path.GetRelativePath(fileRootFullPath, fileInfo.FullName).Replace('\\', '/');
+    visibilityStore.SetVisibility(relativePath, isPublic: false);
 
-    return Results.Ok(new FileEntry(fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, relativePath));
+    return Results.Ok(new FileEntry(fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, relativePath, false));
 });
 
 app.MapFallbackToFile("index.html");
@@ -445,6 +475,43 @@ static bool SecureEquals(string left, string right)
     var leftBytes = Encoding.UTF8.GetBytes(left);
     var rightBytes = Encoding.UTF8.GetBytes(right);
     return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes);
+}
+
+static bool CanBypassAuthForPublicDownload(HttpRequest request, string rootPath, FileVisibilityStore visibilityStore)
+{
+    if (!HttpMethods.IsGet(request.Method) ||
+        !request.Path.StartsWithSegments("/api/files/download", out var remainder))
+    {
+        return false;
+    }
+
+    var encodedPath = remainder.Value?.TrimStart('/');
+    if (string.IsNullOrWhiteSpace(encodedPath))
+    {
+        return false;
+    }
+
+    string decodedPath;
+    try
+    {
+        decodedPath = Uri.UnescapeDataString(encodedPath);
+    }
+    catch (UriFormatException)
+    {
+        return false;
+    }
+
+    if (!TryNormalizeFileRelativePath(decodedPath, out var normalizedRelativePath, out var segments, out _))
+    {
+        return false;
+    }
+
+    if (!TryResolveVisibleFile(rootPath, segments, out _))
+    {
+        return false;
+    }
+
+    return visibilityStore.IsPublic(normalizedRelativePath);
 }
 
 static IEnumerable<FileInfo> EnumerateVisibleFiles(DirectoryInfo directory)
@@ -545,6 +612,69 @@ static bool IsSubPathOf(string rootPath, string candidatePath)
     }
 
     return normalizedCandidate.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, comparison);
+}
+
+static bool TryNormalizeFileRelativePath(string? rawPath, out string normalizedRelativePath, out string[] segments, out string error)
+{
+    normalizedRelativePath = string.Empty;
+    segments = Array.Empty<string>();
+    error = string.Empty;
+
+    if (string.IsNullOrWhiteSpace(rawPath))
+    {
+        error = "Path is required.";
+        return false;
+    }
+
+    var normalizedPath = rawPath.Replace('\\', '/').Trim('/');
+    if (string.IsNullOrWhiteSpace(normalizedPath))
+    {
+        error = "Path is required.";
+        return false;
+    }
+
+    segments = normalizedPath
+        .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
+    {
+        error = "Invalid path.";
+        return false;
+    }
+
+    if (segments.Any(segment => segment.StartsWith(".", StringComparison.Ordinal)))
+    {
+        error = "Hidden paths are not allowed.";
+        return false;
+    }
+
+    normalizedRelativePath = string.Join('/', segments);
+    return true;
+}
+
+static bool TryResolveVisibleFile(string rootPath, IReadOnlyList<string> segments, out FileInfo fileInfo)
+{
+    fileInfo = null!;
+
+    var filePath = Path.GetFullPath(Path.Combine(rootPath, Path.Combine(segments.ToArray())));
+    if (!IsSubPathOf(rootPath, filePath))
+    {
+        return false;
+    }
+
+    var candidate = new FileInfo(filePath);
+    if (!candidate.Exists || IsHidden(candidate))
+    {
+        return false;
+    }
+
+    if (HasHiddenDirectorySegment(candidate.Directory, rootPath))
+    {
+        return false;
+    }
+
+    fileInfo = candidate;
+    return true;
 }
 
 static bool TryNormalizeRelativePath(string? rawPath, out string[] segments, out string error)
@@ -659,5 +789,143 @@ static bool PathsEqual(string left, string right)
         comparison);
 }
 
-internal sealed record FileEntry(string Name, long Size, DateTime LastModifiedUtc, string RelativePath);
+internal sealed record FileEntry(string Name, long Size, DateTime LastModifiedUtc, string RelativePath, bool IsPublic);
 internal sealed record CompleteUploadRequest(string? UploadId, string? FileName, string? Path, int? TotalChunks);
+internal sealed record VisibilityRequest(string? RelativePath, bool IsPublic);
+internal sealed record VisibilityResponse(string RelativePath, bool IsPublic);
+
+internal sealed class FileVisibilityStore
+{
+    private readonly string _rootPath;
+    private readonly string _metadataPath;
+    private readonly object _sync = new();
+    private HashSet<string> _publicFiles;
+
+    public FileVisibilityStore(string rootPath, string metadataPath)
+    {
+        _rootPath = Path.GetFullPath(rootPath);
+        _metadataPath = Path.GetFullPath(metadataPath);
+        _publicFiles = LoadFromDisk();
+    }
+
+    public bool IsPublic(string relativePath)
+    {
+        if (!TryNormalizeStoredPath(relativePath, out var normalizedRelativePath))
+        {
+            return false;
+        }
+
+        lock (_sync)
+        {
+            return _publicFiles.Contains(normalizedRelativePath);
+        }
+    }
+
+    public void SetVisibility(string relativePath, bool isPublic)
+    {
+        if (!TryNormalizeStoredPath(relativePath, out var normalizedRelativePath))
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            var changed = isPublic
+                ? _publicFiles.Add(normalizedRelativePath)
+                : _publicFiles.Remove(normalizedRelativePath);
+
+            if (!changed)
+            {
+                return;
+            }
+
+            PersistToDisk();
+        }
+    }
+
+    private HashSet<string> LoadFromDisk()
+    {
+        if (!File.Exists(_metadataPath))
+        {
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<VisibilityMetadata>(File.ReadAllText(_metadataPath));
+            var loaded = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var rawPath in payload?.PublicFiles ?? Array.Empty<string>())
+            {
+                if (TryNormalizeStoredPath(rawPath, out var normalizedPath))
+                {
+                    loaded.Add(normalizedPath);
+                }
+            }
+
+            return loaded;
+        }
+        catch (JsonException)
+        {
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+        catch (IOException)
+        {
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+    }
+
+    private void PersistToDisk()
+    {
+        Directory.CreateDirectory(_rootPath);
+
+        var metadata = new VisibilityMetadata
+        {
+            PublicFiles = _publicFiles
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .ToArray()
+        };
+
+        var tempPath = _metadataPath + ".tmp";
+        var json = JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(tempPath, json, Encoding.UTF8);
+        File.Move(tempPath, _metadataPath, overwrite: true);
+    }
+
+    private static bool TryNormalizeStoredPath(string? rawPath, out string normalizedPath)
+    {
+        normalizedPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            return false;
+        }
+
+        var canonicalPath = rawPath.Replace('\\', '/').Trim('/');
+        if (string.IsNullOrWhiteSpace(canonicalPath))
+        {
+            return false;
+        }
+
+        var segments = canonicalPath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (segments.Length == 0 ||
+            segments.Any(segment => segment is "." or ".." || segment.StartsWith(".", StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        normalizedPath = string.Join('/', segments);
+        return true;
+    }
+}
+
+internal sealed class VisibilityMetadata
+{
+    [JsonPropertyName("publicFiles")]
+    public string[] PublicFiles { get; init; } = Array.Empty<string>();
+}
