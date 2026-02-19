@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
@@ -8,6 +9,7 @@ var basicAuthUsername = Environment.GetEnvironmentVariable("FILESHARE_USERNAME")
 var basicAuthPassword = Environment.GetEnvironmentVariable("FILESHARE_PASSWORD") ?? "choom";
 var fileRoot = Environment.GetEnvironmentVariable("FILESHARE_ROOT") ?? "/data/files";
 var fileRootFullPath = Path.GetFullPath(fileRoot);
+var uploadTempRoot = Path.GetFullPath(Path.Combine(fileRootFullPath, ".uploads"));
 
 app.Use(async (context, next) =>
 {
@@ -150,6 +152,241 @@ app.MapPost("/api/files/upload", async (HttpRequest request) =>
     catch (IOException) when (File.Exists(destinationPath))
     {
         return Results.Conflict("File already exists.");
+    }
+
+    var fileInfo = new FileInfo(destinationPath);
+    var relativePath = Path.GetRelativePath(fileRootFullPath, fileInfo.FullName).Replace('\\', '/');
+
+    return Results.Ok(new FileEntry(fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, relativePath));
+});
+
+app.MapPost("/api/files/upload/chunk", async (HttpRequest request) =>
+{
+    var contentType = request.ContentType ?? string.Empty;
+    if (!request.HasFormContentType ||
+        !contentType.StartsWith("multipart/form-data", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest("Content type must be multipart/form-data.");
+    }
+
+    IFormCollection form;
+    try
+    {
+        form = await request.ReadFormAsync(request.HttpContext.RequestAborted);
+    }
+    catch (InvalidDataException)
+    {
+        return Results.BadRequest("Invalid form payload.");
+    }
+
+    var chunkFile = form.Files.GetFile("chunk");
+    if (chunkFile is null)
+    {
+        return Results.BadRequest("Field 'chunk' is required.");
+    }
+
+    var uploadIdRaw = form["uploadId"].ToString();
+    if (!TryNormalizeUploadId(uploadIdRaw, out var uploadId, out var uploadIdError))
+    {
+        return Results.BadRequest(uploadIdError);
+    }
+
+    if (!TryNormalizeUploadFileName(form["fileName"].ToString(), out _, out var fileNameError))
+    {
+        return Results.BadRequest(fileNameError);
+    }
+
+    if (!TryNormalizeRelativePath(form["path"].ToString(), out _, out var pathError))
+    {
+        return Results.BadRequest(pathError);
+    }
+
+    if (!int.TryParse(form["chunkIndex"], out var chunkIndex) || chunkIndex < 0)
+    {
+        return Results.BadRequest("Field 'chunkIndex' must be a non-negative integer.");
+    }
+
+    if (!int.TryParse(form["totalChunks"], out var totalChunks) || totalChunks <= 0)
+    {
+        return Results.BadRequest("Field 'totalChunks' must be a positive integer.");
+    }
+
+    if (chunkIndex >= totalChunks)
+    {
+        return Results.BadRequest("Field 'chunkIndex' must be less than 'totalChunks'.");
+    }
+
+    var uploadDirectoryPath = Path.GetFullPath(Path.Combine(uploadTempRoot, uploadId));
+    if (!IsSubPathOf(uploadTempRoot, uploadDirectoryPath))
+    {
+        return Results.BadRequest("Invalid upload id.");
+    }
+
+    Directory.CreateDirectory(uploadDirectoryPath);
+
+    var chunkPath = Path.GetFullPath(Path.Combine(uploadDirectoryPath, GetChunkFileName(chunkIndex)));
+    if (!IsSubPathOf(uploadDirectoryPath, chunkPath))
+    {
+        return Results.BadRequest("Invalid chunk path.");
+    }
+
+    await using (var outputStream = new FileStream(
+                     chunkPath,
+                     FileMode.Create,
+                     FileAccess.Write,
+                     FileShare.None,
+                     bufferSize: 81920,
+                     useAsync: true))
+    await using (var inputStream = chunkFile.OpenReadStream())
+    {
+        await inputStream.CopyToAsync(outputStream, request.HttpContext.RequestAborted);
+    }
+
+    return Results.Ok(new { ok = true, chunkIndex });
+});
+
+app.MapPost("/api/files/upload/complete", async (HttpRequest request) =>
+{
+    CompleteUploadRequest? payload;
+    try
+    {
+        payload = await request.ReadFromJsonAsync<CompleteUploadRequest>(request.HttpContext.RequestAborted);
+    }
+    catch (JsonException)
+    {
+        return Results.BadRequest("Invalid JSON payload.");
+    }
+
+    if (payload is null)
+    {
+        return Results.BadRequest("Body is required.");
+    }
+
+    if (!TryNormalizeUploadId(payload.UploadId, out var uploadId, out var uploadIdError))
+    {
+        return Results.BadRequest(uploadIdError);
+    }
+
+    if (!TryNormalizeUploadFileName(payload.FileName, out var fileName, out var fileNameError))
+    {
+        return Results.BadRequest(fileNameError);
+    }
+
+    if (!TryNormalizeRelativePath(payload.Path, out var pathSegments, out var pathError))
+    {
+        return Results.BadRequest(pathError);
+    }
+
+    if (payload.TotalChunks is null || payload.TotalChunks <= 0)
+    {
+        return Results.BadRequest("Field 'totalChunks' must be a positive integer.");
+    }
+
+    var totalChunks = payload.TotalChunks.Value;
+    var uploadDirectoryPath = Path.GetFullPath(Path.Combine(uploadTempRoot, uploadId));
+    if (!IsSubPathOf(uploadTempRoot, uploadDirectoryPath))
+    {
+        return Results.BadRequest("Invalid upload id.");
+    }
+
+    if (!Directory.Exists(uploadDirectoryPath))
+    {
+        return Results.BadRequest("Upload not found.");
+    }
+
+    var chunkPaths = new string[totalChunks];
+    for (var chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+    {
+        var chunkPath = Path.GetFullPath(Path.Combine(uploadDirectoryPath, GetChunkFileName(chunkIndex)));
+        if (!IsSubPathOf(uploadDirectoryPath, chunkPath))
+        {
+            return Results.BadRequest("Invalid chunk path.");
+        }
+
+        if (!File.Exists(chunkPath))
+        {
+            return Results.BadRequest($"Missing chunk at index {chunkIndex}.");
+        }
+
+        chunkPaths[chunkIndex] = chunkPath;
+    }
+
+    var relativeSegments = pathSegments.Append(fileName).ToArray();
+    var destinationPath = Path.GetFullPath(Path.Combine(fileRootFullPath, Path.Combine(relativeSegments)));
+    if (!IsSubPathOf(fileRootFullPath, destinationPath))
+    {
+        return Results.BadRequest("Invalid path.");
+    }
+
+    if (File.Exists(destinationPath))
+    {
+        return Results.Conflict("File already exists.");
+    }
+
+    var destinationDirectory = Path.GetDirectoryName(destinationPath) ?? fileRootFullPath;
+    if (!IsSubPathOf(fileRootFullPath, destinationDirectory))
+    {
+        return Results.BadRequest("Invalid path.");
+    }
+
+    Directory.CreateDirectory(destinationDirectory);
+
+    try
+    {
+        await using var outputStream = new FileStream(
+            destinationPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 81920,
+            useAsync: true);
+
+        foreach (var chunkPath in chunkPaths)
+        {
+            await using var chunkStream = new FileStream(
+                chunkPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 81920,
+                useAsync: true);
+            await chunkStream.CopyToAsync(outputStream, request.HttpContext.RequestAborted);
+        }
+    }
+    catch (IOException) when (File.Exists(destinationPath))
+    {
+        return Results.Conflict("File already exists.");
+    }
+    catch (OperationCanceledException)
+    {
+        if (File.Exists(destinationPath))
+        {
+            File.Delete(destinationPath);
+        }
+
+        throw;
+    }
+    catch (Exception)
+    {
+        if (File.Exists(destinationPath))
+        {
+            File.Delete(destinationPath);
+        }
+
+        throw;
+    }
+
+    try
+    {
+        Directory.Delete(uploadDirectoryPath, recursive: true);
+    }
+    catch (IOException)
+    {
+        // Ignore cleanup failures; upload is complete.
+    }
+    catch (UnauthorizedAccessException)
+    {
+        // Ignore cleanup failures; upload is complete.
     }
 
     var fileInfo = new FileInfo(destinationPath);
@@ -375,6 +612,39 @@ static bool TryNormalizeUploadFileName(string? rawFileName, out string fileName,
     return true;
 }
 
+static bool TryNormalizeUploadId(string? rawUploadId, out string uploadId, out string error)
+{
+    error = string.Empty;
+    uploadId = string.Empty;
+
+    if (string.IsNullOrWhiteSpace(rawUploadId))
+    {
+        error = "Field 'uploadId' is required.";
+        return false;
+    }
+
+    var trimmed = rawUploadId.Trim();
+    if (trimmed.Length > 128)
+    {
+        error = "Field 'uploadId' is too long.";
+        return false;
+    }
+
+    if (trimmed.Any(character => !char.IsLetterOrDigit(character) && character is not '-' and not '_'))
+    {
+        error = "Field 'uploadId' contains invalid characters.";
+        return false;
+    }
+
+    uploadId = trimmed;
+    return true;
+}
+
+static string GetChunkFileName(int chunkIndex)
+{
+    return $"chunk-{chunkIndex + 1:D6}.part";
+}
+
 static bool PathsEqual(string left, string right)
 {
     var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
@@ -386,3 +656,4 @@ static bool PathsEqual(string left, string right)
 }
 
 internal sealed record FileEntry(string Name, long Size, DateTime LastModifiedUtc, string RelativePath);
+internal sealed record CompleteUploadRequest(string? UploadId, string? FileName, string? Path, int? TotalChunks);

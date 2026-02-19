@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "https:
 import { createRoot } from "https://esm.sh/react-dom@18/client";
 
 const LIST_ENDPOINT = "/api/files";
-const UPLOAD_ENDPOINT = "/api/files/upload";
+const CHUNK_UPLOAD_ENDPOINT = "/api/files/upload/chunk";
+const COMPLETE_UPLOAD_ENDPOINT = "/api/files/upload/complete";
+const CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
 const h = React.createElement;
 
 function formatBytes(bytes) {
@@ -42,6 +44,14 @@ function encodeRelativePath(path) {
     .filter(Boolean)
     .map((segment) => encodeURIComponent(segment))
     .join("/");
+}
+
+function createUploadId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID().replace(/[^a-zA-Z0-9_-]/g, "");
+  }
+
+  return `upload_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 function App() {
@@ -85,16 +95,26 @@ function App() {
     setSelectedFile(file);
   }
 
-  function extractUploadErrorMessage(xhr) {
-    const responseText = typeof xhr.responseText === "string" ? xhr.responseText.trim() : "";
+  async function extractUploadErrorMessage(response) {
+    let responseText = "";
+    try {
+      responseText = (await response.text()).trim();
+    } catch {
+      // Ignore body parsing failures and keep fallback message.
+    }
+
     if (!responseText) {
-      return `Upload failed with HTTP ${xhr.status}.`;
+      return `Upload failed with HTTP ${response.status}.`;
     }
 
     try {
       const parsed = JSON.parse(responseText);
       if (typeof parsed === "string") {
         return `Upload failed: ${parsed}`;
+      }
+
+      if (parsed && typeof parsed.detail === "string" && parsed.detail) {
+        return `Upload failed: ${parsed.detail}`;
       }
 
       if (parsed && typeof parsed.title === "string") {
@@ -107,7 +127,7 @@ function App() {
     return `Upload failed: ${responseText}`;
   }
 
-  function handleUpload(event) {
+  async function handleUpload(event) {
     event.preventDefault();
     if (!selectedFile) {
       setUploadState({
@@ -118,13 +138,9 @@ function App() {
       return;
     }
 
-    const formData = new FormData();
-    formData.append("file", selectedFile);
-
     const trimmedPath = path.trim();
-    if (trimmedPath) {
-      formData.append("path", trimmedPath);
-    }
+    const uploadId = createUploadId();
+    const totalChunks = Math.max(1, Math.ceil(selectedFile.size / CHUNK_SIZE_BYTES));
 
     setUploadState({
       status: "uploading",
@@ -132,63 +148,86 @@ function App() {
       progress: 0
     });
 
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", UPLOAD_ENDPOINT);
+    try {
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+        const chunkStart = chunkIndex * CHUNK_SIZE_BYTES;
+        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE_BYTES, selectedFile.size);
+        const chunkBlob = selectedFile.slice(chunkStart, chunkEnd);
 
-    xhr.upload.onprogress = (uploadEvent) => {
-      if (!uploadEvent.lengthComputable) {
-        return;
-      }
-
-      const progress = Math.min(100, Math.round((uploadEvent.loaded / uploadEvent.total) * 100));
-      setUploadState({
-        status: "uploading",
-        message: `Uploading... ${progress}%`,
-        progress
-      });
-    };
-
-    xhr.onload = async () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        let relativePath = selectedFile.name;
-        try {
-          const payload = JSON.parse(xhr.responseText);
-          if (payload && typeof payload.relativePath === "string" && payload.relativePath) {
-            relativePath = payload.relativePath;
-          }
-        } catch {
-          // Ignore JSON parsing errors and keep fallback display name.
+        const formData = new FormData();
+        formData.append("chunk", chunkBlob, `${selectedFile.name}.part`);
+        formData.append("uploadId", uploadId);
+        formData.append("fileName", selectedFile.name);
+        formData.append("chunkIndex", String(chunkIndex));
+        formData.append("totalChunks", String(totalChunks));
+        if (trimmedPath) {
+          formData.append("path", trimmedPath);
         }
 
-        setUploadState({
-          status: "success",
-          message: `Uploaded ${relativePath}.`,
-          progress: 100
+        const chunkResponse = await fetch(CHUNK_UPLOAD_ENDPOINT, {
+          method: "POST",
+          body: formData
         });
-        setSelectedFile(null);
-        if (fileInputRef.current) {
-          fileInputRef.current.value = "";
+
+        if (!chunkResponse.ok) {
+          throw new Error(await extractUploadErrorMessage(chunkResponse));
         }
-        await loadFiles();
-        return;
+
+        const bytesUploaded = chunkEnd;
+        const progress = selectedFile.size > 0
+          ? Math.min(100, Math.round((bytesUploaded / selectedFile.size) * 100))
+          : Math.round(((chunkIndex + 1) / totalChunks) * 100);
+        setUploadState({
+          status: "uploading",
+          message: `Uploading... ${progress}%`,
+          progress
+        });
+      }
+
+      const completeResponse = await fetch(COMPLETE_UPLOAD_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          uploadId,
+          fileName: selectedFile.name,
+          path: trimmedPath || "",
+          totalChunks
+        })
+      });
+
+      if (!completeResponse.ok) {
+        throw new Error(await extractUploadErrorMessage(completeResponse));
+      }
+
+      let relativePath = selectedFile.name;
+      try {
+        const payload = await completeResponse.json();
+        if (payload && typeof payload.relativePath === "string" && payload.relativePath) {
+          relativePath = payload.relativePath;
+        }
+      } catch {
+        // Ignore JSON parsing errors and keep fallback display name.
       }
 
       setUploadState({
-        status: "error",
-        message: extractUploadErrorMessage(xhr),
-        progress: 0
+        status: "success",
+        message: `Uploaded ${relativePath}.`,
+        progress: 100
       });
-    };
-
-    xhr.onerror = () => {
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      await loadFiles();
+    } catch (err) {
       setUploadState({
         status: "error",
-        message: "Upload failed due to a network error.",
+        message: err instanceof Error ? err.message : "Upload failed due to a network error.",
         progress: 0
       });
-    };
-
-    xhr.send(formData);
+    }
   }
 
   const totalSize = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);

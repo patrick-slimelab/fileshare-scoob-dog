@@ -5,7 +5,7 @@ Simple authenticated file browser/download service:
 - Static React frontend served from `wwwroot`
 - HTTP Basic Auth on all routes
 - Recursive file listing API + secure download API
-- Authenticated multipart upload API + frontend upload widget
+- Authenticated upload APIs + frontend upload widget
 
 ## Configuration
 
@@ -37,15 +37,22 @@ Service:
 Web UI:
 - Use the upload form on the main page to choose a file.
 - Optional subfolder path (for example `reports/2026`) uploads into that directory under `FILESHARE_ROOT`.
-- The UI shows upload state and refreshes the file list after success.
+- Uploads are sent in 8 MB chunks to stay under reverse-proxy request-size limits (for example Cloudflare).
+- The UI shows upload state/progress and refreshes the file list after success.
 
 API:
-- Endpoint: `POST /api/files/upload`
-- Content-Type: `multipart/form-data`
-- Required form field: `file`
-- Optional form field: `path` (relative subdirectory under `FILESHARE_ROOT`)
+- Chunk endpoint: `POST /api/files/upload/chunk`
+  - Content-Type: `multipart/form-data`
+  - Required form fields: `chunk`, `uploadId`, `fileName`, `chunkIndex`, `totalChunks`
+  - Optional form field: `path` (relative subdirectory under `FILESHARE_ROOT`)
+  - Response JSON: `{ok:true,chunkIndex}`
+- Complete endpoint: `POST /api/files/upload/complete`
+  - Content-Type: `application/json`
+  - Request JSON: `{uploadId,fileName,path,totalChunks}`
+  - Response JSON: `{name,size,lastModifiedUtc,relativePath}`
+- Chunk size: `8 MB` per request
 - Overwrite behavior: existing destination files return `409 Conflict`
-- Response JSON: `{name,size,lastModifiedUtc,relativePath}`
+- Legacy single-request upload endpoint remains available: `POST /api/files/upload`
 
 Security behavior:
 - Rejects path traversal (`.` / `..`) and hidden path segments (segments starting with `.`)
@@ -56,9 +63,18 @@ Example:
 
 ```bash
 curl -u scoob:choom \
-  -F "file=@./example.txt" \
+  -F "chunk=@./example.part0" \
+  -F "uploadId=demo123" \
+  -F "fileName=example.txt" \
+  -F "chunkIndex=0" \
+  -F "totalChunks=1" \
   -F "path=docs/notes" \
-  http://localhost:8080/api/files/upload
+  http://localhost:8080/api/files/upload/chunk
+
+curl -u scoob:choom \
+  -H "Content-Type: application/json" \
+  -d '{"uploadId":"demo123","fileName":"example.txt","path":"docs/notes","totalChunks":1}' \
+  http://localhost:8080/api/files/upload/complete
 ```
 
 ## Reverse proxy note (`fileshare.scoob.dog`)
