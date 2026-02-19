@@ -30,7 +30,7 @@ docker compose up --build
 
 Service:
 - URL: `http://localhost:8080`
-- Mounted files: `./shared-files` -> `/data/files` (read-only)
+- Mounted files: `./shared-files` -> `/data/files` (read/write for uploads)
 
 ## Uploads
 

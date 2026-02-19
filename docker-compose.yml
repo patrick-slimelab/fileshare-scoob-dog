@@ -11,5 +11,5 @@ services:
       FILESHARE_ROOT: /data/files
       ASPNETCORE_URLS: http://+:8080
     volumes:
-      - ./shared-files:/data/files:ro
+      - ./shared-files:/data/files
     restart: unless-stopped
