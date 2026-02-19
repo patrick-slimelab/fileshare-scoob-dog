@@ -1,0 +1,19 @@
+# Build output
+bin/
+obj/
+
+# User files
+*.user
+*.suo
+
+# Logs
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Keep shared-files directory but ignore contents
+shared-files/*
+!shared-files/.gitkeep
