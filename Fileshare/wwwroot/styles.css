@@ -161,6 +161,17 @@ a:hover {
   text-decoration: underline;
 }
 
+.actions-cell {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.actions-cell button {
+  padding: 0.35rem 0.7rem;
+  font-size: 0.85rem;
+}
+
 @media (max-width: 800px) {
   .upload-controls {
     grid-template-columns: 1fr;

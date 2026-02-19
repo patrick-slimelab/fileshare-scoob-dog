@@ -55,6 +55,14 @@ function createUploadId() {
   return `upload_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function getDownloadPath(relativePath) {
+  return `/api/files/download/${encodeRelativePath(relativePath)}`;
+}
+
+function buildPermalink(relativePath) {
+  return new URL(getDownloadPath(relativePath), window.location.origin).toString();
+}
+
 function App() {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -66,6 +74,7 @@ function App() {
     message: "",
     progress: 0
   });
+  const [copiedLink, setCopiedLink] = useState("");
   const fileInputRef = useRef(null);
 
   const loadFiles = useCallback(async () => {
@@ -252,6 +261,24 @@ function App() {
     }
   }
 
+  async function handleCopyPermalink(relativePath) {
+    const permalink = buildPermalink(relativePath);
+
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("Clipboard API unavailable");
+      }
+
+      await navigator.clipboard.writeText(permalink);
+      setCopiedLink(relativePath);
+      setTimeout(() => {
+        setCopiedLink((current) => (current === relativePath ? "" : current));
+      }, 1800);
+    } catch {
+      window.prompt("Copy permalink:", permalink);
+    }
+  }
+
   const totalSize = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
   const isUploading = uploadState.status === "uploading";
 
@@ -326,7 +353,7 @@ function App() {
             h("th", null, "Name"),
             h("th", null, "Size"),
             h("th", null, "Modified (UTC)"),
-            h("th", null, "Download")
+            h("th", null, "Actions")
           )
         ),
         h(
@@ -341,11 +368,19 @@ function App() {
               h("td", null, formatUtc(file.lastModifiedUtc)),
               h(
                 "td",
-                null,
+                { className: "actions-cell" },
                 h(
                   "a",
-                  { href: `/api/files/download/${encodeRelativePath(file.relativePath)}` },
+                  { href: getDownloadPath(file.relativePath) },
                   "Download"
+                ),
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    onClick: () => handleCopyPermalink(file.relativePath)
+                  },
+                  copiedLink === file.relativePath ? "Copied!" : "Permalink"
                 )
               )
             )
