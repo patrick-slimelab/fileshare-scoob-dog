@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: fileshare_app
     ports:
       - "18080:8080"
     environment:
@@ -13,3 +14,13 @@ services:
     volumes:
       - ./shared-files:/data/files
     restart: unless-stopped
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: fileshare_tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN_FILESHARE}
+    depends_on:
+      - fileshare

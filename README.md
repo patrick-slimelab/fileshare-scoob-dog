@@ -29,12 +29,24 @@ Then open `http://localhost:5000` or `http://localhost:5001` depending on launch
 ## Docker Compose
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
 Service:
 - URL: `http://localhost:8080`
 - Mounted files: `./shared-files` -> `/data/files` (read/write for uploads)
+
+### Dedicated Cloudflare Tunnel (separate from slimelab.ai)
+
+This stack includes its own `fileshare_tunnel` container.
+Set token in a local `.env` file:
+
+```bash
+TUNNEL_TOKEN_FILESHARE=your-fileshare-tunnel-token
+```
+
+Then configure this tunnel in Cloudflare with only:
+- `fileshare.scoob.dog` -> `http://fileshare:8080`
 
 ## Uploads
 
